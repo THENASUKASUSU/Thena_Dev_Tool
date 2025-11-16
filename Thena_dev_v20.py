@@ -2098,436 +2098,6 @@ def decrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
             logger.error(f"Error saat mendecryption (simple) {input_path}: {e}") # Perbaikan: gunakan input_path
         return False, None
 
-def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: bytes, add_random_padding: bool = True, hide_paths: bool = False, use_rsa: bool = False, use_curve25519: bool = False):
-    """Encrypts a file using a master key.
-    Args:
-        input_path (str): The path to the file to encrypt.
-        output_path (str): The path to write the encrypted file to.
-        master_key (bytes): The master key to use for encryption.
-        add_random_padding (bool): Whether to add random padding to the file.
-        hide_paths (bool): Whether to hide the file paths in the output.
-    Returns:
-        A tuple containing a boolean indicating success and the path to the
-        encrypted file.
-    """
-    logger = logging.getLogger(__name__)
-    start_time = time.time()
-    output_dir = os.path.dirname(output_path) or "."
-
-    if not os.path.isfile(input_path):
-        print(f"{RED}❌ Error: File input '{input_path}' tidak ditemukan.{RESET}")
-        logger.error(f"File input '{input_path}' tidak ditemukan.")
-        return False, None
-
-    if not os.access(input_path, os.R_OK):
-        print(f"{RED}❌ Error: File input '{input_path}' tidak dapat dibaca.{RESET}")
-        logger.error(f"File input '{input_path}' tidak dapat dibaca (izin akses).")
-        return False, None
-
-    if os.path.getsize(input_path) == 0:
-        print(f"{RED}❌ Error: File input '{input_path}' kosong.{RESET}")
-        logger.error(f"File input '{input_path}' kosong.")
-        return False, None
-
-    if not check_file_size_limit(input_path):
-        return False, None
-
-    # Validasi ekstensi output sederhana
-    if not output_path.endswith('.encrypted'):
-        print(f"{YELLOW}⚠️  Peringatan: Nama file output '{output_path}' tidak memiliki ekstensi '.encrypted'.{RESET}")
-        confirm = input(f"{YELLOW}Lanjutkan dengan nama ini? (y/N): {RESET}").strip().lower()
-        if confirm not in ['y', 'yes']:
-            print(f"{YELLOW}Operasi dibatalkan.{RESET}")
-            logger.info("Operasi dibatalkan karena nama output tidak memiliki ekstensi '.encrypted'.")
-            return False, None
-
-    if not check_disk_space(input_path, output_dir):
-        return False, None
-
-    try:
-        if hide_paths:
-            print(f"\n{CYAN}[ Encrypting... ]{RESET}")
-            logger.info(f"Memulai encrypted file (dengan Master Key) di direktori: {output_dir}")
-        else:
-            print(f"\n{CYAN}[ Encrypting with Master Key... ]{RESET}")
-            logger.info(f"Memulai encrypted file (dengan Master Key): {input_path}")
-
-        input_size = os.path.getsize(input_path)
-        logger.info(f"Ukuran file input: {input_size} bytes")
-
-        plaintext_data = b""
-        # --- V12/V13/V14: Gunakan mmap jika file besar dan diaktifkan ---
-        large_file_threshold = config.get("large_file_threshold", 10 * 1024 * 1024) # 10MB default
-        if config.get("use_mmap_for_large_files", False) and input_size > large_file_threshold:
-            print(f"{CYAN}Menggunakan mmap untuk membaca file besar...{RESET}")
-            with open(input_path, 'rb') as infile:
-                with mmap.mmap(infile.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
-                    plaintext_data = mmapped_file[:]
-        else:
-            with open(input_path, 'rb') as infile:
-                while True:
-                    chunk = infile.read(config["chunk_size"])
-                    if not chunk:
-                        break
-                    plaintext_data += chunk
-
-        # --- V14: Secure Memory Locking ---
-        if config.get("enable_secure_memory_locking", False):
-            master_key_addr = ctypes.addressof((ctypes.c_char * len(master_key)).from_buffer_copy(master_key))
-            secure_mlock(master_key_addr, len(master_key))
-            logger.debug(f"Master Key disimpan di memori terkunci untuk {input_path}")
-            # Register untuk integrity check
-            if config.get("enable_runtime_data_integrity", False):
-                register_sensitive_data(f"master_key_{input_path}", master_key)
-
-        # --- Tambahkan Kompresi di sini ---
-        original_checksum = calculate_checksum(plaintext_data)
-        logger.debug(f"Checksum data (sebelum kompresi): {original_checksum.hex()}")
-
-        if config.get("enable_compression", False):
-            logger.debug("Mengompresi data sebelum encrypted...")
-            plaintext_data = compress_data(plaintext_data)
-        else:
-            logger.debug("Kompresi dinonaktifkan, melewati.")
-
-        data = plaintext_data
-        padding_added = 0
-        if add_random_padding:
-            padding_length = secrets.randbelow(config["chunk_size"])
-            random_padding = secrets.token_bytes(padding_length)
-            data = plaintext_data + random_padding
-            padding_added = padding_length
-
-        # --- Gunakan HKDF untuk derivasi kunci file ---
-        file_key = derive_file_key_from_master_key(master_key, input_path) # Gunakan path input untuk HKDF
-
-        # --- Logika untuk RSA dan Curve25519 ---
-        encrypted_file_key = file_key
-        key_encryption_method = "master_key" # Default
-        parts_to_write = []
-        if use_rsa or use_curve25519:
-            rsa_private_key, x25519_private_key = load_keys(password, keyfile_path)
-            if rsa_private_key is None or x25519_private_key is None:
-                cprint(f"{YELLOW}Kunci asimetris tidak ditemukan. Membuat yang baru...{RESET}")
-                rsa_private_key, x25519_private_key = generate_and_save_keys(password, keyfile_path)
-                cprint(f"{GREEN}Kunci asimetris baru berhasil dibuat dan disimpan.{RESET}")
-
-            if use_rsa:
-                encrypted_file_key = rsa_private_key.public_key().encrypt(
-                    encrypted_file_key,
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                        algorithm=hashes.SHA256(),
-                        label=None
-                    )
-                )
-
-            if use_curve25519:
-                ephemeral_private = x25519.X25519PrivateKey.generate()
-                ephemeral_public_key_bytes = ephemeral_private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-                shared_key = ephemeral_private.exchange(x25519_private_key.public_key())
-                hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'curve25519-aes-wrap')
-                wrapping_key = hkdf.derive(shared_key)
-                nonce_wrap = secrets.token_bytes(12)
-                encrypted_file_key = AESGCM(wrapping_key).encrypt(nonce_wrap, encrypted_file_key, None)
-                parts_to_write.extend([
-                    ("x25519_ephemeral_pub", ephemeral_public_key_bytes),
-                    ("x25519_nonce_wrap", nonce_wrap)
-                ])
-
-            key_method_parts = ["master_key"]
-            if use_rsa: key_method_parts.append("rsa")
-            if use_curve25519: key_method_parts.append("x25519")
-            key_encryption_method = "+".join(key_method_parts)
-
-        # --- V14: Secure Memory Locking ---
-        if config.get("enable_secure_memory_locking", False):
-            file_key_addr = ctypes.addressof((ctypes.c_char * len(file_key)).from_buffer_copy(file_key))
-            secure_mlock(file_key_addr, len(file_key))
-            logger.debug(f"File Key disimpan di memori terkunci untuk {input_path}")
-            # Register untuk integrity check
-            if config.get("enable_runtime_data_integrity", False):
-                register_sensitive_data(f"file_key_{input_path}", file_key)
-
-        # --- Pilih Algoritma encrypted ---
-        algo = config.get("encryption_algorithm", "aes-gcm").lower()
-        if algo == "aes-gcm":
-            if CRYPTOGRAPHY_AVAILABLE:
-                nonce = secrets.token_bytes(config["gcm_nonce_len"])
-                cipher = AESGCM(file_key)
-                ciphertext = cipher.encrypt(nonce, data, associated_data=None)
-                tag = b"" # AESGCM (cryptography) menggabungkan tag
-            elif PYCRYPTODOME_AVAILABLE: # <-- Sekarang variabel ini selalu didefinisikan
-                nonce = get_random_bytes(config["gcm_nonce_len"]) # Gunakan get_random_bytes dari pycryptodome
-                cipher = AES.new(file_key, AES.MODE_GCM, nonce=nonce)
-                ciphertext, tag = cipher.encrypt_and_digest(data)
-            else:
-                print(f"{RED}❌ Error: Tidak ada pustaka tersedia untuk algoritma '{algo}'.{RESET}")
-                logger.error(f"Tidak ada pustaka tersedia untuk algoritma '{algo}'.")
-                return False, None
-        else:
-            print(f"{RED}❌ Error: Algoritma encrypted '{algo}' tidak dikenal atau tidak didukung di versi ini.{RESET}")
-            logger.error(f"Algoritma encrypted '{algo}' tidak dikenal atau tidak didukung di versi ini.")
-            return False, None
-
-        parts_to_write.append(("key_method", key_encryption_method.encode('ascii')))
-        if "master_key" in key_encryption_method:
-             master_fernet_key = base64.urlsafe_b64encode(master_key)
-             master_fernet = Fernet(master_fernet_key)
-             encrypted_file_key = master_fernet.encrypt(encrypted_file_key)
-
-        # --- V14: Secure Memory Locking untuk HMAC Key ---
-        if config.get("enable_secure_memory_locking", False):
-            hmac_key_addr = ctypes.addressof((ctypes.c_char * len(hmac_key)).from_buffer_copy(hmac_key))
-            secure_mlock(hmac_key_addr, len(hmac_key))
-            logger.debug(f"HMAC Key disimpan di memori terkunci untuk {input_path}")
-            # Register untuk integrity check
-            if config.get("enable_runtime_data_integrity", False):
-                register_sensitive_data(f"hmac_key_{input_path}", hmac_key)
-
-        # --- V10/V11/V12/V13/V14: Custom File Format Shuffle & Dynamic Header (Variable Parts) ---
-        parts_to_write = [
-            ("nonce", nonce),
-            ("checksum", original_checksum),
-            ("padding_added", padding_added.to_bytes(config["padding_size_length"], byteorder='big')),
-        ]
-        if algo == "aes-gcm" and PYCRYPTODOME_AVAILABLE: # Hanya jika menggunakan pycryptodome
-            parts_to_write.append(("tag", tag))
-        parts_to_write.extend([
-            ("encrypted_file_key_len", len(encrypted_file_key).to_bytes(4, byteorder='big')),
-            ("encrypted_file_key", encrypted_file_key),
-            ("ciphertext", ciphertext),
-        ])
-
-        # --- V14: Generate Dynamic Header Parts ---
-        dynamic_header_parts = generate_dynamic_header_parts(input_path, len(plaintext_data))
-        # Update bagian-bagian yang akan ditulis dengan informasi dari dynamic header
-        # Misalnya, kita bisa menyisipkan bagian-bagian ini ke dalam struktur file utama
-        # atau menyimpannya di awal file sebagai header meta.
-        # Untuk saat ini, kita sertakan bagian-bagian dari dynamic_header_parts ke dalam parts_to_write
-        # tapi kita simpan informasi tentang struktur ini di tempat lain (misalnya dalam checksum tambahan atau HMAC).
-        # Kita bisa menyimpan struktur (urutan dan nama bagian) dalam checksum tambahan atau HMAC tambahan.
-        # Atau, kita buat header yang menjelaskan struktur file.
-        # Format setiap bagian: [4_byte_nama][4_byte_panjang][data_panjang_byte]
-        final_parts_to_write = []
-        for part_name, part_data in parts_to_write:
-             final_parts_to_write.append((part_name, part_data))
-        # Tambahkan bagian dari dynamic header (ini opsional dan bisa diacak)
-        for dyn_part_name, dyn_part_data in dynamic_header_parts:
-             final_parts_to_write.append((dyn_part_name, dyn_part_data))
-
-        # --- V18: Tambahkan Decoy Blocks ---
-        if config.get("enable_decoy_blocks", False):
-            decoy_count = secrets.randbelow(config.get("decoy_block_count", 5) + 1)
-            for i in range(decoy_count):
-                decoy_size = secrets.randbelow(config.get("decoy_block_max_size", 1024) + 1)
-                decoy_data = secrets.token_bytes(decoy_size)
-                final_parts_to_write.append((f"decoy_{i}", decoy_data))
-                logger.debug(f"Menambahkan blok decoy 'decoy_{i}' dengan ukuran {decoy_size} bytes.")
-
-        shuffled_parts = shuffle_file_parts(final_parts_to_write)
-
-        # --- V14: Dynamic Header Format (Meta Header) ---
-        meta_header_version = config["dynamic_header_version"].to_bytes(2, byteorder='big') # 2 byte versi
-        num_total_parts_bytes = len(shuffled_parts).to_bytes(4, byteorder='big') # 4 byte jumlah bagian
-        meta_header_prefix = meta_header_version + num_total_parts_bytes
-
-        structure_payload = b''
-        for part_name, part_data in shuffled_parts:
-             part_name_bytes = part_name.encode('ascii').ljust(255, b'\x00') # Nama bagian (255 byte, null-terminated)
-             part_size_bytes = len(part_data).to_bytes(4, byteorder='little') # Ukuran bagian (4 byte, little endian)
-             structure_payload += part_name_bytes + part_size_bytes
-
-        # --- V18: Encrypted Meta Header ---
-        header_salt = secrets.token_bytes(16)
-        header_key = derive_key_for_header(master_key, header_salt)
-        header_nonce = secrets.token_bytes(config["gcm_nonce_len"])
-        header_cipher = AESGCM(header_key)
-        encrypted_structure_payload = header_cipher.encrypt(header_nonce, structure_payload, associated_data=None)
-
-        # V18 FIX: Store the size of the encrypted header
-        encrypted_header_size_bytes = len(encrypted_structure_payload).to_bytes(4, byteorder='big')
-
-        # Simpan nonce header setelah meta header prefix
-        header_to_write = meta_header_prefix + encrypted_header_size_bytes + header_nonce + encrypted_structure_payload
-
-        total_output_size = len(header_salt) + len(header_to_write) + sum(len(part_data) for _, part_data in shuffled_parts)
-
-        with open(output_path, 'wb') as outfile:
-            print_loading_progress()
-            # V18 FIX: Tulis header_salt di luar header terenkripsi
-            outfile.write(header_salt)
-            # Tulis meta header dulu
-            outfile.write(header_to_write)
-            # Tulis bagian-bagian yang diacak
-            for part_name, part_data in shuffled_parts:
-                outfile.write(part_data) # Data bagian
-                logger.debug(f"Menulis bagian '{part_name}' ({len(part_data)} bytes) ke file output.")
-
-        output_size = os.path.getsize(output_path)
-        logger.info(f"Ukuran file output: {output_size} bytes")
-
-        # --- V8: Verifikasi Integritas Output ---
-        if config.get("verify_output_integrity", True):
-            print(f"{CYAN}Memverifikasi integritas file output...{RESET}")
-            try:
-                with open(output_path, 'rb') as f:
-                    file_content = f.read()
-                calculated_file_checksum = calculate_checksum(file_content)
-                # Untuk verifikasi output, kita bisa membandingkan checksum dari seluruh file output
-                # dengan checksum yang disimpan di dalam file (checksum data asli) dan HMAC.
-                # Atau, kita bisa encrypted ulang file input dan bandingkan outputnya (lebih berat).
-                # Untuk saat ini, kita hanya memastikan file output bisa dibaca dan ukurannya sesuai.
-                if os.path.getsize(output_path) != output_size:
-                    print(f"{RED}❌ Error: Ukuran file output tidak sesuai setelah verifikasi.{RESET}")
-                    logger.error(f"Verifikasi integritas output gagal: ukuran tidak cocok untuk {output_path}")
-                    return False, None
-                print(f"{GREEN}✅ Verifikasi integritas output berhasil.{RESET}")
-                logger.info(f"Verifikasi integritas output berhasil untuk {output_path}")
-            except Exception as e:
-                print(f"{RED}❌ Error saat memverifikasi integritas output: {e}{RESET}")
-                logger.error(f"Verifikasi integritas output gagal untuk {output_path}: {e}")
-                return False, None
-
-
-        end_time = time.time()
-        duration = end_time - start_time
-        logger.info(f"Durasi encrypted: {duration:.2f} detik")
-
-        # --- Hardening V14: Secure Memory Overwrite (FIXED) ---
-        if config.get("enable_secure_memory_overwrite", False):
-            secure_overwrite_variable(master_key)
-            secure_overwrite_variable(file_key)
-            secure_overwrite_variable(encrypted_file_key)
-            secure_overwrite_variable(plaintext_data)
-            secure_overwrite_variable(ciphertext)
-            secure_overwrite_variable(original_checksum)
-            # Variabel lain yang sensitif bisa ditambahkan di sini
-
-        if hide_paths:
-            print(f"{GREEN}✅ File berhasil diencrypted.{RESET}")
-            logger.info(f"Encrypted (dengan Master Key) berhasil ke file di direktori: {output_dir}")
-        else:
-            print(f"{GREEN}✅ File '{input_path}' berhasil diencrypted ke '{output_path}' (dengan Master Key).{RESET}")
-            logger.info(f"Encrypted (dengan Master Key) berhasil: {input_path} -> {output_path}")
-
-        return True, output_path
-
-    except FileNotFoundError:
-        if hide_paths:
-            print(f"{RED}❌ Error: File input tidak ditemukan.{RESET}")
-            logger.error(f"File input tidak ditemukan saat encrypted (dengan Master Key) di direktori: {output_dir}")
-        else:
-            print(f"{RED}❌ Error: File '{input_path}' tidak ditemukan.{RESET}") # Perbaikan: gunakan input_path
-            logger.error(f"File '{input_path}' tidak ditemukan saat encrypted (dengan Master Key).") # Perbaikan: gunakan input_path
-        return False, None
-    except Exception as e:
-        if hide_paths:
-            print(f"{RED}❌ Error saat mengencrypted file: {e}{RESET}")
-            logger.error(f"Error saat mengencrypted (dengan Master Key) di direktori '{output_dir}': {e}")
-        else:
-            print(f"{RED}❌ Error saat mengencrypted file (dengan Master Key): {e}{RESET}")
-            logger.error(f"Error saat mengencrypted (dengan Master Key) {input_path}: {e}") # Perbaikan: gunakan input_path
-        return False, None
-
-def encrypt_file_hybrid(input_path: str, output_path: str, rsa_private_key, x25519_private_key, add_random_padding: bool = True, hide_paths: bool = False):
-    """Encrypts a file using a hybrid encryption scheme."""
-    try:
-        ephemeral_private_key = x25519.X25519PrivateKey.generate()
-        ephemeral_public_key = ephemeral_private_key.public_key()
-
-        # ECDH key exchange
-        shared_key = ephemeral_private_key.exchange(x25519_private_key.public_key())
-
-        # Derive encryption key
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'hybrid encryption',
-        )
-        encryption_key = hkdf.derive(shared_key)
-
-        # Encrypt with AES-GCM
-        with open(input_path, "rb") as f:
-            plaintext = f.read()
-
-        iv = os.urandom(12)
-        cipher = AESGCM(encryption_key)
-        ciphertext = cipher.encrypt(iv, plaintext, None)
-
-        # Sign with RSA
-        signature = rsa_private_key.sign(
-            ciphertext,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-
-        with open(output_path, "wb") as f:
-            f.write(ephemeral_public_key.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            ))
-            f.write(iv)
-            f.write(signature)
-            f.write(ciphertext)
-        return True, output_path
-    except Exception as e:
-        logger.error(f"Error saat enkripsi hybrid: {e}")
-        return False, None
-
-def decrypt_file_hybrid(input_path: str, output_path: str, rsa_public_key, x25519_private_key, hide_paths: bool = False):
-    """Decrypts a file using a hybrid encryption scheme."""
-    try:
-        signature_size = rsa_public_key.key_size // 8
-        with open(input_path, "rb") as f:
-            ephemeral_public_key_bytes = f.read(32)
-            iv = f.read(12)
-            signature = f.read(signature_size)
-            ciphertext = f.read()
-
-        ephemeral_public_key = x25519.X25519PublicKey.from_public_bytes(ephemeral_public_key_bytes)
-
-        # Verify with RSA
-        try:
-            rsa_public_key.verify(
-                signature,
-                ciphertext,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-        except Exception:
-            raise ValueError("Invalid signature")
-
-        # ECDH key exchange
-        shared_key = x25519_private_key.exchange(ephemeral_public_key)
-
-        # Derive decryption key
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'hybrid encryption',
-        )
-        decryption_key = hkdf.derive(shared_key)
-
-        # Decrypt with AES-GCM
-        cipher = AESGCM(decryption_key)
-        plaintext = cipher.decrypt(iv, ciphertext, None)
-
-        with open(output_path, "wb") as f:
-            f.write(plaintext)
-        return True, output_path
-    except Exception as e:
-        logger.error(f"Error saat dekripsi hybrid: {e}")
-        return False, None
-
 
 def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: bytes, password: str, keyfile_path: str = None, add_random_padding: bool = True, hide_paths: bool = False, use_rsa: bool = False, use_curve25519: bool = False):
     """Encrypts a file using a master key.
@@ -2643,36 +2213,36 @@ def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: 
             if config.get("enable_runtime_data_integrity", False):
                 register_sensitive_data(f"file_key_{input_path}", file_key)
 
-        # --- Pilih Algoritma encrypted ---
+        # --- Pilih Algoritma Encrypted ---
         algo = config.get("encryption_algorithm", "aes-gcm").lower()
+        supported_algos = ["aes-gcm", "chacha20-poly1305"]
+        if algo not in supported_algos:
+            print_error_box(f"Error: Algoritma '{algo}' di konfigurasi tidak didukung.")
+            cprint(f"{YELLOW}Pilihan yang valid adalah: {', '.join(supported_algos)}{RESET}")
+            logger.error(f"Algoritma '{algo}' tidak valid.")
+            return False, None
+
         if algo == "aes-gcm":
             if CRYPTOGRAPHY_AVAILABLE:
                 nonce = secrets.token_bytes(config["gcm_nonce_len"])
                 cipher = AESGCM(file_key)
                 ciphertext = cipher.encrypt(nonce, data, associated_data=None)
                 tag = b"" # AESGCM (cryptography) menggabungkan tag
-            elif PYCRYPTODOME_AVAILABLE: # <-- Sekarang variabel ini selalu didefinisikan
-                nonce = get_random_bytes(config["gcm_nonce_len"]) # Gunakan get_random_bytes dari pycryptodome
+            elif PYCRYPTODOME_AVAILABLE:
+                nonce = get_random_bytes(config["gcm_nonce_len"])
                 cipher = AES.new(file_key, AES.MODE_GCM, nonce=nonce)
                 ciphertext, tag = cipher.encrypt_and_digest(data)
             else:
-                print(f"{RED}❌ Error: Tidak ada pustaka tersedia untuk algoritma '{algo}'.{RESET}")
-                logger.error(f"Tidak ada pustaka tersedia untuk algoritma '{algo}'.")
+                print_error_box("Error: Tidak ada pustaka (cryptography/pycryptodome) untuk AES-GCM.")
                 return False, None
         elif algo == "chacha20-poly1305":
-            if CRYPTOGRAPHY_AVAILABLE:
-                nonce = secrets.token_bytes(12)
-                cipher = ChaCha20Poly1305(file_key)
-                ciphertext = cipher.encrypt(nonce, data, associated_data=None)
-                tag = b""
-            else:
-                print(f"{RED}❌ Error: Algoritma '{algo}' memerlukan modul 'cryptography'.{RESET}")
-                logger.error(f"Algoritma '{algo}' tidak tersedia tanpa 'cryptography'.")
+            if not CRYPTOGRAPHY_AVAILABLE:
+                print_error_box("Error: ChaCha20-Poly1305 memerlukan modul 'cryptography'.")
                 return False, None
-        else:
-            print(f"{RED}❌ Error: Algoritma encrypted '{algo}' tidak dikenal atau tidak didukung di versi ini.{RESET}")
-            logger.error(f"Algoritma encrypted '{algo}' tidak dikenal atau tidak didukung di versi ini.")
-            return False, None
+            nonce = secrets.token_bytes(12)
+            cipher = ChaCha20Poly1305(file_key)
+            ciphertext = cipher.encrypt(nonce, data, associated_data=None)
+            tag = b""
 
         # Kunci file terencrypted tetap seperti sebelumnya
         master_fernet_key = base64.urlsafe_b64encode(master_key)
@@ -3059,26 +2629,40 @@ def decrypt_file_with_master_key(input_path: str, output_path: str, master_key: 
 
         # --- Decryption berdasarkan algoritma ---
         algo = config.get("encryption_algorithm", "aes-gcm").lower()
+        supported_algos = ["aes-gcm", "chacha20-poly1305"]
+        if algo not in supported_algos:
+            print_error_box(f"Error: Algoritma '{algo}' di konfigurasi tidak didukung.")
+            cprint(f"{YELLOW}Pilihan yang valid adalah: {', '.join(supported_algos)}{RESET}")
+            logger.error(f"Algoritma '{algo}' tidak valid.")
+            return False, None
+
         if algo == "aes-gcm":
-            if PYCRYPTODOME_AVAILABLE: # <-- Sekarang variabel ini selalu didefinisikan
+            if PYCRYPTODOME_AVAILABLE:
                 cipher = AES.new(file_key, AES.MODE_GCM, nonce=nonce)
                 try:
                     plaintext_data = cipher.decrypt_and_verify(ciphertext, tag)
                 except ValueError:
-                    print(f"{RED}❌ Error: Decryption gagal. File rusak (otentikasi AES-GCM gagal).{RESET}")
-                    logger.error(f"Decryption gagal (otentikasi AES-GCM pycryptodome) untuk {input_path}") # Perbaikan: gunakan input_path
+                    print_error_box("Dekripsi gagal: Otentikasi AES-GCM gagal (file rusak/password salah).")
                     return False, None
             elif CRYPTOGRAPHY_AVAILABLE:
                 cipher = AESGCM(file_key)
                 try:
                     plaintext_data = cipher.decrypt(nonce, ciphertext, associated_data=None)
-                except Exception as e:
-                    print(f"{RED}❌ Error: Decryption gagal. File rusak (otentikasi AES-GCM cryptography gagal).{RESET}")
-                    logger.error(f"Decryption gagal (otentikasi AES-GCM cryptography) untuk {input_path}: {e}") # Perbaikan: gunakan input_path
+                except Exception:
+                    print_error_box("Dekripsi gagal: Otentikasi AES-GCM gagal (file rusak/password salah).")
                     return False, None
             else:
-                print(f"{RED}❌ Error: Tidak ada pustaka tersedia untuk decryption AES-GCM.{RESET}")
-                logger.error(f"Tidak ada pustaka tersedia untuk decryption AES-GCM.")
+                print_error_box("Error: Tidak ada pustaka (cryptography/pycryptodome) untuk AES-GCM.")
+                return False, None
+        elif algo == "chacha20-poly1305":
+            if not CRYPTOGRAPHY_AVAILABLE:
+                print_error_box("Error: ChaCha20-Poly1305 memerlukan modul 'cryptography'.")
+                return False, None
+            cipher = ChaCha20Poly1305(file_key)
+            try:
+                plaintext_data = cipher.decrypt(nonce, ciphertext, associated_data=None)
+            except Exception:
+                print_error_box("Dekripsi gagal: Otentikasi ChaCha20-Poly1305 gagal (file rusak/password salah).")
                 return False, None
         if padding_added > 0:
             if len(plaintext_data) < padding_added:
@@ -3574,6 +3158,14 @@ def main():
                     cprint("─" * 50)
                     add_pad = input(f"{BOLD}Tambahkan padding acak? (y/N): {RESET}").strip().lower()
                     add_padding = add_pad not in ['n', 'no']
+
+                    # --- Penjelasan Lapisan Keamanan Tambahan ---
+                    cprint(f"\n{CYAN}--- Lapisan Keamanan Tambahan (Opsional) ---{RESET}")
+                    cprint("Anda dapat menambahkan lapisan keamanan untuk melindungi kunci AES/ChaCha20.")
+                    cprint("Ini membuat file lebih sulit di-brute-force, tetapi memerlukan file kunci tambahan.")
+                    cprint("Urutan yang disarankan: AES/ChaCha20 -> RSA -> Curve25519.")
+                    cprint("─" * 50)
+
 
                     # Tanyakan opsi keamanan tambahan di awal
                     use_rsa = False
