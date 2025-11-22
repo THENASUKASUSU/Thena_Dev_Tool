@@ -1560,15 +1560,6 @@ def encrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
 
         # AEAD ciphers like AES-GCM and ChaCha20-Poly1305 provide authentication, so a separate HMAC is not needed.
 
-        # --- V14: Secure Memory Locking untuk HMAC Key ---
-        if config.get("enable_secure_memory_locking", False):
-            hmac_key_addr = ctypes.addressof((ctypes.c_char * len(hmac_key)).from_buffer_copy(hmac_key))
-            secure_mlock(hmac_key_addr, len(hmac_key))
-            logger.debug(f"Kunci HMAC disimpan di memori terkunci untuk {input_path}")
-            # Register untuk integrity check
-            if config.get("enable_runtime_data_integrity", False):
-                register_sensitive_data(f"hmac_key_{input_path}", hmac_key)
-
         # --- V10/V11/V12/V13/V14: Custom File Format Shuffle & Dynamic Header (Variable Parts) ---
         parts_to_write = [
             ("nonce", nonce),
@@ -1868,15 +1859,6 @@ def decrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
                 register_sensitive_data(f"key_{input_path}", key)
 
         # AEAD ciphers like AES-GCM and ChaCha20-Poly1305 provide authentication, so a separate HMAC is not needed.
-
-        # --- V14: Secure Memory Locking untuk HMAC Key ---
-        if config.get("enable_secure_memory_locking", False):
-            hmac_key_addr = ctypes.addressof((ctypes.c_char * len(hmac_key)).from_buffer_copy(hmac_key))
-            secure_mlock(hmac_key_addr, len(hmac_key))
-            logger.debug(f"Kunci HMAC disimpan di memori terkunci untuk {input_path}")
-            # Register untuk integrity check
-            if config.get("enable_runtime_data_integrity", False):
-                register_sensitive_data(f"hmac_key_{input_path}", hmac_key)
 
         # --- Decryption berdasarkan algoritma ---
         algo = config.get("encryption_algorithm", "aes-gcm").lower()
@@ -2301,15 +2283,6 @@ def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: 
         encrypted_file_key = master_fernet.encrypt(file_key)
 
         # AEAD ciphers like AES-GCM and ChaCha20-Poly1305 provide authentication, so a separate HMAC is not needed.
-
-        # --- V14: Secure Memory Locking untuk HMAC Key ---
-        if config.get("enable_secure_memory_locking", False):
-            hmac_key_addr = ctypes.addressof((ctypes.c_char * len(hmac_key)).from_buffer_copy(hmac_key))
-            secure_mlock(hmac_key_addr, len(hmac_key))
-            logger.debug(f"HMAC Key disimpan di memori terkunci untuk {input_path}")
-            # Register untuk integrity check
-            if config.get("enable_runtime_data_integrity", False):
-                register_sensitive_data(f"hmac_key_{input_path}", hmac_key)
 
         # --- V10/V11/V12/V13/V14: Custom File Format Shuffle & Dynamic Header (Variable Parts) ---
         parts_to_write = [
@@ -2896,15 +2869,6 @@ def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: 
         encrypted_file_key = master_fernet.encrypt(file_key)
 
         # AEAD ciphers like AES-GCM and ChaCha20-Poly1305 provide authentication, so a separate HMAC is not needed.
-
-        # --- V14: Secure Memory Locking untuk HMAC Key ---
-        if config.get("enable_secure_memory_locking", False):
-            hmac_key_addr = ctypes.addressof((ctypes.c_char * len(hmac_key)).from_buffer_copy(hmac_key))
-            secure_mlock(hmac_key_addr, len(hmac_key))
-            logger.debug(f"HMAC Key disimpan di memori terkunci untuk {input_path}")
-            # Register untuk integrity check
-            if config.get("enable_runtime_data_integrity", False):
-                register_sensitive_data(f"hmac_key_{input_path}", hmac_key)
 
         # --- V10/V11/V12/V13/V14: Custom File Format Shuffle & Dynamic Header (Variable Parts) ---
         parts_to_write = [
@@ -3780,7 +3744,7 @@ def main():
         register_critical_function(derive_key_from_password_and_keyfile)
         register_critical_function(derive_file_key_from_master_key)
         register_critical_function(derive_hmac_key_from_master_key)
-        register_critical_function(derive_key_from_master_key_for_header) # V14
+        register_critical_function(derive_key_for_header) # V14
         register_critical_function(encrypt_file_simple)
         register_critical_function(decrypt_file_simple)
         register_critical_function(encrypt_file_with_master_key)
