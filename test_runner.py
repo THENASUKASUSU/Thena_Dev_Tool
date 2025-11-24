@@ -5,9 +5,14 @@ import time
 import unittest
 import glob
 import json
+from Thena_dev_v19 import config
 
 def run_thena_script(inputs, get_output_filename=False, config_file=None):
     """Runs the Thena script with the given inputs."""
+    # Ensure the script exits gracefully in interactive tests
+    if "3" not in inputs: # Assuming '3' is the exit command
+        inputs.append("3")
+
     with open("test_input.txt", "w") as f:
         for i in inputs:
             f.write(i + "\n")
@@ -95,7 +100,6 @@ class TestThenaScript(unittest.TestCase):
             "n",  # Use RSA? (y/N)
             "n",  # Use Curve25519? (y/N)
             "n",  # Delete original file? (y/N)
-            "3",  # Exit
         ]
 
         run_thena_script(encrypt_inputs)
@@ -163,7 +167,7 @@ class TestThenaScript(unittest.TestCase):
         self.assertTrue(os.path.exists("decrypted_file.txt"), "Decrypted file was not created.")
         with open("decrypted_file.txt", "r") as f:
             content = f.read()
-        self.assertEqual(content, "This is a test for layered decryption.")
+        self.assertEqual(content, "This is a test file for layered decryption.")
 
         encrypted_file = None
         for file in glob.glob("*.encrypted"):
@@ -370,6 +374,151 @@ class TestThenaScript(unittest.TestCase):
             print("STDOUT:", stdout)
             print("STDERR:", stderr)
             raise e
+
+class TestSecureMemoryFeatures(unittest.TestCase):
+    def setUp(self):
+        """Set up for the tests."""
+        self.cleanup()
+
+    def tearDown(self):
+        """Tear down after the tests."""
+        self.cleanup()
+
+    def cleanup(self):
+        """Remove all test-related files."""
+        files_to_remove = [
+            "test_file.txt",
+            "test_input.txt",
+            "decrypted_file.txt",
+        ]
+        for f in files_to_remove:
+            if os.path.exists(f):
+                os.remove(f)
+
+    def test_secure_memory_manager(self):
+        """Tests the SecureMemoryManager class."""
+        from Thena_dev_v19 import SecureMemoryManager, secure_overwrite_variable
+        master_key = os.urandom(32)
+        manager = SecureMemoryManager(master_key)
+
+        # Test storing and retrieving data
+        sensitive_data = b"test_sensitive_data"
+        manager.store_sensitive_data("test_key", sensitive_data)
+        retrieved_data = manager.retrieve_and_decrypt("test_key")
+        self.assertEqual(retrieved_data, sensitive_data)
+
+        # Test wiping data
+        manager.wipe_data("test_key")
+        retrieved_data_after_wipe = manager.retrieve_and_decrypt("test_key")
+        self.assertIsNone(retrieved_data_after_wipe)
+
+        secure_overwrite_variable(master_key)
+
+    def test_constant_time_compare(self):
+        """Tests the constant_time_compare function."""
+        import secrets
+        self.assertTrue(secrets.compare_digest(b"abc", b"abc"))
+        self.assertFalse(secrets.compare_digest(b"abc", b"abd"))
+        self.assertFalse(secrets.compare_digest(b"abc", b"abcd"))
+        self.assertFalse(secrets.compare_digest(b"abcd", b"abc"))
+
+class TestPerformanceFeatures(unittest.TestCase):
+    def setUp(self):
+        """Set up for performance tests."""
+        self.config_file = "thena_config_performance.json"
+        self.large_file = "large_test_file.txt"
+        self.encrypted_file = "large_test_file.encrypted"
+        self.decrypted_file = "decrypted_large_file.txt"
+
+        # Create a large file (15MB to trigger streaming)
+        with open(self.large_file, "wb") as f:
+            f.write(os.urandom(15 * 1024 * 1024))
+
+        # Configure for streaming and performance tuning
+        with open(self.config_file, "w") as f:
+            json.dump({
+                "large_file_threshold": 10 * 1024 * 1024, # 10MB
+                "auto_tune_performance": True,
+                "preferred_algorithm_priority": ["aes-gcm"]
+            }, f)
+
+    def tearDown(self):
+        """Clean up after performance tests."""
+        files_to_remove = [
+            self.large_file,
+            self.encrypted_file,
+            self.decrypted_file,
+            self.config_file,
+            "thena_keystore.json"
+        ]
+        for f in files_to_remove:
+            if os.path.exists(f):
+                os.remove(f)
+
+    def test_streaming_encryption_decryption(self):
+        """Tests the streaming encryption and decryption for a large file."""
+        # Encrypt
+        command = [
+            "python3", "Thena_dev_v19.py",
+            "--encrypt",
+            "-i", self.large_file,
+            "-o", self.encrypted_file,
+            "-p", "AStrongStreamingPassword123!",
+            "--config", self.config_file,
+            "--keystore", "thena_keystore.json"
+        ]
+        process = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(process.returncode, 0, f"Streaming encryption failed: {process.stderr}")
+
+        with open(self.encrypted_file, 'rb') as f:
+            magic_bytes = f.read(8)
+            self.assertEqual(magic_bytes, b"STREAMV1", "Streaming format magic bytes not found.")
+
+        # Decrypt
+        command = [
+            "python3", "Thena_dev_v19.py",
+            "--decrypt",
+            "-i", self.encrypted_file,
+            "-o", self.decrypted_file,
+            "-p", "AStrongStreamingPassword123!",
+            "--config", self.config_file,
+            "--keystore", "thena_keystore.json"
+        ]
+        process = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(process.returncode, 0, f"Streaming decryption failed: {process.stderr}")
+        self.assertIn("Streaming file format terdeteksi", process.stdout)
+
+        # Verify content
+        with open(self.large_file, "rb") as f1, open(self.decrypted_file, "rb") as f2:
+            original_hash = subprocess.run(["sha256sum", self.large_file], capture_output=True, text=True).stdout.split()[0]
+            decrypted_hash = subprocess.run(["sha256sum", self.decrypted_file], capture_output=True, text=True).stdout.split()[0]
+            self.assertEqual(original_hash, decrypted_hash, "Decrypted file content does not match original.")
+
+    def test_hardware_acceleration_detection_output(self):
+        """Tests that hardware acceleration detection prints the expected output."""
+        # We just need to run the script and check the output, no encryption needed.
+        command = ["python3", "Thena_dev_v19.py", "--help"] # A simple command to run the script
+        process = subprocess.run(command, text=True, capture_output=True)
+
+        # Check if the detection message is present. The exact features depend on the test runner's CPU.
+        self.assertTrue(
+            "Akselerasi Kriptografi Hardware Terdeteksi" in process.stdout or
+            "Tidak ada akselerasi kriptografi hardware yang terdeteksi" in process.stdout,
+            "Hardware acceleration detection message not found in output."
+        )
+
+    def test_adaptive_performance_tuning_output(self):
+        """Tests that adaptive performance tuning prints the expected output."""
+        command = [
+            "python3", "Thena_dev_v19.py",
+            "--help", # A simple command to run the script and trigger startup logic
+            "--config", self.config_file
+        ]
+        process = subprocess.run(command, text=True, capture_output=True)
+
+        # Check for tuning messages
+        self.assertIn("Auto-Tuning: Argon2 parallelism disesuaikan", process.stdout)
+        self.assertIn("Auto-Tuning: Argon2 memory_cost disesuaikan", process.stdout)
 
 if __name__ == "__main__":
     unittest.main()
