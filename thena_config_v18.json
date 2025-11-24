@@ -62,7 +62,7 @@
     "enable_secure_memory_overwrite": false,
     "enable_dynamic_header_integrity_check": true,
     "hardware_integration_enabled": false,
-    "post_quantum_ready": false,
+        "post_quantum_ready": false,
     "enable_secure_memory_locking": false,
     "enable_runtime_data_integrity": false,
     "custom_format_variable_parts": true,

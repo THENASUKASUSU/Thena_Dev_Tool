@@ -32,7 +32,8 @@ try:
     from cryptography.hazmat.primitives.asymmetric import rsa, padding, x25519
     from cryptography.fernet import Fernet
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
-    from cryptography import exceptions
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography import exceptions as crypto_exceptions
     CRYPTOGRAPHY_AVAILABLE = True
     print(f"{GREEN}✅ Modul 'cryptography' ditemukan. Fitur Lanjutan Tersedia.{RESET}")
 except ImportError as e:
@@ -109,6 +110,10 @@ import ctypes.util # Impor ctypes.util untuk secure memory (V10/V11/V12/V13/V14)
 import signal # Impor signal untuk anti-debug (V10/V11/V12/V13/V14)
 import mmap # Impor mmap untuk performa/file besar (V12/V13/V14)
 import struct # Impor struct untuk header dinamis (V12/V13/V14)
+import secrets
+import time
+import psutil
+import cpuinfo
 
 # --- Nama File Konfigurasi dan Log ---
 CONFIG_FILE = "thena_config_v18.json"
@@ -643,6 +648,8 @@ def load_config():
         "enable_decoy_blocks": True, # Aktifkan blok data umpan (decoy)
         "decoy_block_max_size": 1024, # Ukuran maksimum blok decoy (bytes)
         "decoy_block_count": 5, # Jumlah maksimum blok decoy
+        # --- V19: Performance Tuning ---
+        "auto_tune_performance": True, # Aktifkan penyesuaian performa otomatis
     }
 
     config_path = Path(CONFIG_FILE)
@@ -998,6 +1005,186 @@ def deobfuscate_memory(data) -> bytes:
     # Deobfuskasi adalah operasi yang sama dengan XOR
     return obfuscate_memory(data)
 
+def detect_hardware_acceleration():
+    """Detects CPU features for hardware-accelerated cryptography."""
+    try:
+        info = cpuinfo.get_cpu_info()
+        flags = info.get('flags', [])
+
+        supported_features = []
+        if 'aes' in flags:
+            supported_features.append("AES-NI")
+        if 'avx' in flags:
+            supported_features.append("AVX")
+        if 'pclmulqdq' in flags:
+            supported_features.append("PCLMULQDQ")
+
+        if supported_features:
+            features_str = ", ".join(supported_features)
+            print(f"{GREEN}✅ Akselerasi Kriptografi Hardware Terdeteksi: {features_str}{RESET}")
+            logger.info(f"Hardware acceleration detected: {features_str}")
+            if config.get("auto_tune_performance", False):
+                print(f"{CYAN}   Mode auto-tuning diaktifkan.{RESET}")
+        else:
+            print(f"{YELLOW}⚠️  Tidak ada akselerasi kriptografi hardware yang terdeteksi.{RESET}")
+            logger.warning("No hardware cryptographic acceleration detected.")
+
+    except Exception as e:
+        logger.warning(f"Tidak dapat mendeteksi fitur hardware: {e}")
+
+class PerformanceTuner:
+    """Dynamically tunes performance parameters based on system resources."""
+    @staticmethod
+    def tune_argon2_params():
+        """Adjusts Argon2 parameters based on available memory and CPU cores."""
+        if not config.get("auto_tune_performance", False):
+            return
+
+        try:
+            # Tune parallelism
+            cpu_cores = psutil.cpu_count(logical=False)
+            if cpu_cores:
+                original_parallelism = config["argon2_parallelism"]
+                # Use half the physical cores, with a minimum of 1 and max of original setting
+                tuned_parallelism = min(original_parallelism, max(1, cpu_cores // 2))
+                config["argon2_parallelism"] = tuned_parallelism
+                print(f"{CYAN}Auto-Tuning: Argon2 parallelism disesuaikan ke {tuned_parallelism} (dari {original_parallelism}).{RESET}")
+                logger.info(f"Tuned Argon2 parallelism from {original_parallelism} to {tuned_parallelism}")
+
+            # Tune memory_cost
+            available_mem_gb = psutil.virtual_memory().available / (1024**3)
+            original_mem_cost = config["argon2_memory_cost"]
+            tuned_mem_cost = original_mem_cost
+
+            # Adjust based on available RAM, setting safe upper/lower bounds
+            if available_mem_gb > 8: # >8GB RAM
+                tuned_mem_cost = 2**21 # ~2GB
+            elif available_mem_gb > 4: # >4GB RAM
+                tuned_mem_cost = 2**20 # ~1GB
+            elif available_mem_gb > 2: # >2GB RAM
+                tuned_mem_cost = 2**19 # ~512MB
+            else: # <2GB RAM
+                tuned_mem_cost = 2**18 # ~256MB
+
+            # Ensure we don't exceed the original configured value as a safeguard
+            tuned_mem_cost = min(original_mem_cost, tuned_mem_cost)
+            config["argon2_memory_cost"] = tuned_mem_cost
+
+            if tuned_mem_cost != original_mem_cost:
+                print(f"{CYAN}Auto-Tuning: Argon2 memory_cost disesuaikan ke {tuned_mem_cost // 1024}MB (dari {original_mem_cost // 1024}MB).{RESET}")
+                logger.info(f"Tuned Argon2 memory_cost from {original_mem_cost} to {tuned_mem_cost}")
+
+        except Exception as e:
+            logger.warning(f"Gagal melakukan auto-tuning parameter Argon2: {e}")
+
+def _is_streaming_supported(algo):
+    """Checks if an algorithm supports streaming."""
+    # Only AES-GCM from `cryptography` is supported for true streaming for now.
+    return algo == "aes-gcm" and CRYPTOGRAPHY_AVAILABLE
+
+class StreamEncryptor:
+    """Handles streaming encryption for AES-GCM."""
+    def __init__(self, key):
+        self.key = key
+        self.nonce = secrets.token_bytes(config["gcm_nonce_len"])
+        cipher = Cipher(algorithms.AES(self.key), modes.GCM(self.nonce))
+        self.encryptor = cipher.encryptor()
+        self.tag = None
+
+    def update(self, chunk):
+        return self.encryptor.update(chunk)
+
+    def finalize(self):
+        self.encryptor.finalize()
+        self.tag = self.encryptor.tag
+        return b""
+
+class StreamDecryptor:
+    """Handles streaming decryption for AES-GCM."""
+    def __init__(self, key, nonce, tag):
+        self.key = key
+        self.nonce = nonce
+        cipher = Cipher(algorithms.AES(self.key), modes.GCM(self.nonce, tag))
+        self.decryptor = cipher.decryptor()
+
+    def update(self, chunk):
+        return self.decryptor.update(chunk)
+
+    def finalize(self):
+        self.decryptor.finalize()
+        return b""
+
+def constant_time_compare(val1, val2):
+    """Performs a constant-time comparison of two values."""
+    return secrets.compare_digest(val1, val2)
+
+def random_delay():
+    """Waits for a random time to mitigate timing attacks."""
+    time.sleep(secrets.randbelow(10) / 1000.0)
+
+class SecureMemoryManager:
+    """Manages sensitive data in memory by encrypting it when not in use."""
+
+    def __init__(self, master_key):
+        self._master_key = master_key
+        self._enclave = {}
+        self._lock = threading.Lock()
+
+    def _derive_key(self, key_id):
+        """Derives a unique key for a piece of data using HKDF."""
+        if not CRYPTOGRAPHY_AVAILABLE:
+            raise RuntimeError("Cryptography module is required for SecureMemoryManager.")
+
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=key_id.encode('utf-8'),
+            info=b'secure-memory-manager-key'
+        )
+        return hkdf.derive(self._master_key)
+
+    def _encrypt(self, key, data):
+        """Encrypts data with AES-GCM."""
+        iv = secrets.token_bytes(12)
+        cipher = AESGCM(key)
+        encrypted_data = cipher.encrypt(iv, data, None)
+        return iv + encrypted_data
+
+    def _decrypt(self, key, encrypted_data):
+        """Decrypts data with AES-GCM."""
+        iv = encrypted_data[:12]
+        data = encrypted_data[12:]
+        cipher = AESGCM(key)
+        return cipher.decrypt(iv, data, None)
+
+    def store_sensitive_data(self, key_id, data):
+        """Encrypts and stores sensitive data."""
+        with self._lock:
+            derived_key = self._derive_key(key_id)
+            encrypted_data = self._encrypt(derived_key, data)
+            self._enclave[key_id] = encrypted_data
+            secure_overwrite_variable(derived_key)
+
+    def retrieve_and_decrypt(self, key_id):
+        """Retrieves and decrypts sensitive data."""
+        with self._lock:
+            if key_id not in self._enclave:
+                return None
+
+            encrypted_data = self._enclave[key_id]
+            derived_key = self._derive_key(key_id)
+            decrypted_data = self._decrypt(derived_key, encrypted_data)
+            secure_overwrite_variable(derived_key)
+            return decrypted_data
+
+    def wipe_data(self, key_id):
+        """Securely wipes a piece of data from the manager."""
+        with self._lock:
+            if key_id in self._enclave:
+                secure_overwrite_variable(self._enclave[key_id])
+                del self._enclave[key_id]
+                gc.collect()
+
 class AlgorithmNegotiator:
     """Selects the best available encryption algorithm."""
 
@@ -1185,8 +1372,40 @@ class KeyManager:
         self.keystore = self._load_or_initialize_keystore()
 
     def _derive_keystore_key(self, salt):
-        """Derives the encryption key for the keystore."""
-        return derive_key_from_password_and_keyfile(self.password, salt, self.keyfile_path)
+        """
+        Derives the encryption key for the keystore using stable, non-tuned parameters.
+        This is critical to ensure the keystore can be opened across different runs
+        where auto-tuning might change the global KDF parameters.
+        """
+        if not ARGON2_AVAILABLE:
+            raise RuntimeError("Argon2 is required for keystore operations.")
+
+        password_bytes = self.password.encode('utf-8')
+        keyfile_bytes = b""
+        if self.keyfile_path:
+            if not os.path.isfile(self.keyfile_path):
+                # This should be handled gracefully
+                logger.error(f"Keyfile '{self.keyfile_path}' not found for keystore derivation.")
+                return None
+            with open(self.keyfile_path, 'rb') as kf:
+                keyfile_bytes = kf.read()
+
+        combined_input = password_bytes + keyfile_bytes
+
+        try:
+            # Use stable, hardcoded parameters, NOT the auto-tuned ones from the global config.
+            return hash_secret_raw(
+                secret=combined_input,
+                salt=salt,
+                time_cost=16,          # Stable value, reasonably strong
+                memory_cost=1048576,   # 1GB, stable value
+                parallelism=4,         # Stable value
+                hash_len=32,           # For an AES-256 key
+                type=Type.ID
+            )
+        except Exception as e:
+            logger.error(f"Error deriving keystore key with stable parameters: {e}")
+            return None
 
     def _load_or_initialize_keystore(self):
         """Loads the keystore from file or creates a new one."""
@@ -1204,8 +1423,9 @@ class KeyManager:
                 cipher = AESGCM(keystore_key)
                 decrypted_data = cipher.decrypt(nonce, encrypted_data, None)
                 return json.loads(decrypted_data.decode('utf-8'))
-            except (FileNotFoundError, ValueError, json.JSONDecodeError) as e:
-                print_error_box(f"Gagal memuat keystore, mungkin rusak atau password salah: {e}")
+            except (FileNotFoundError, ValueError, json.JSONDecodeError, crypto_exceptions.InvalidTag, TypeError) as e:
+                message = f"Gagal memuat keystore, mungkin rusak atau password salah: {e}"
+                print(message, file=sys.stderr)
                 logger.error(f"Gagal memuat keystore: {e}", exc_info=True)
                 # In a real scenario, you might want to handle this more gracefully
                 # For now, we'll exit to prevent creating a new keystore over a potentially recoverable one.
@@ -1786,6 +2006,70 @@ def encrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
         input_size = os.path.getsize(input_path)
         logger.info(f"Ukuran file input: {input_size} bytes")
 
+        algo = AlgorithmNegotiator.get_best_algorithm()
+        if algo is None:
+            print(f"{RED}❌ Error: Tidak ada algoritma enkripsi yang didukung tersedia.{RESET}")
+            logger.error("Tidak ada algoritma enkripsi yang didukung tersedia.")
+            return False, None
+
+        large_file_threshold = config.get("large_file_threshold", 10 * 1024 * 1024)
+
+        # Override to aes-gcm if streaming is possible and file is large
+        if input_size > large_file_threshold and _is_streaming_supported("aes-gcm"):
+            algo = "aes-gcm"
+
+        logger.info(f"Menggunakan algoritma: {algo}")
+
+        if _is_streaming_supported(algo) and input_size > large_file_threshold:
+            print(f"{CYAN}File besar terdeteksi. Menggunakan mode streaming...{RESET}")
+            logger.info(f"Using streaming mode for large file {input_path}")
+
+            # 1. Calculate original checksum by streaming the input file
+            original_checksum_calculator = hashlib.sha256()
+            with open(input_path, 'rb') as f_in:
+                while chunk := f_in.read(config["chunk_size"]):
+                    original_checksum_calculator.update(chunk)
+            original_checksum = original_checksum_calculator.digest()
+
+            # 2. Derive key
+            salt = secrets.token_bytes(config["file_key_length"])
+            key = derive_key_from_password_and_keyfile(password, salt, keyfile_path)
+            if key is None:
+                logger.error(f"Gagal menurunkan kunci untuk {input_path}")
+                return False, None
+
+            # 3. Setup encryptor
+            stream_encryptor = StreamEncryptor(key)
+            nonce = stream_encryptor.nonce
+
+            # 4. Write file header and stream content
+            with open(output_path, 'wb') as f_out:
+                f_out.write(salt)
+                f_out.write(b"STREAMV1")
+
+                algo_bytes = algo.encode('utf-8')
+                f_out.write(len(algo_bytes).to_bytes(1, 'big'))
+                f_out.write(algo_bytes)
+
+                f_out.write(nonce)
+                f_out.write(original_checksum)
+
+                with open(input_path, 'rb') as f_in:
+                    while chunk := f_in.read(config["chunk_size"]):
+                        encrypted_chunk = stream_encryptor.update(chunk)
+                        f_out.write(encrypted_chunk)
+
+                stream_encryptor.finalize()
+                tag = stream_encryptor.tag
+                f_out.write(tag)
+
+            end_time = time.time()
+            duration = end_time - start_time
+            logger.info(f"Durasi enkripsi (streaming): {duration:.2f} detik")
+            print(f"{GREEN}✅ File '{input_path}' berhasil dienkripsi ke '{output_path}' (Streaming Mode).{RESET}")
+            return True, output_path
+
+        # --- Fallback to in-memory for smaller files or unsupported algos ---
         salt = secrets.token_bytes(config["file_key_length"]) # Gunakan panjang yang sesuai untuk salt
         key = derive_key_from_password_and_keyfile(password, salt, keyfile_path)
         if key is None:
@@ -1801,25 +2085,8 @@ def encrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
             if config.get("enable_runtime_data_integrity", False):
                 register_sensitive_data(f"key_{input_path}", key)
 
-        plaintext_data = b""
-        # --- V12/V13/V14: Gunakan mmap jika file besar dan diaktifkan ---
-        large_file_threshold = config.get("large_file_threshold", 10 * 1024 * 1024) # 10MB default
-        if config.get("use_mmap_for_large_files", False) and input_size > large_file_threshold:
-            print(f"{CYAN}Menggunakan mmap untuk membaca file besar...{RESET}")
-            with open(input_path, 'rb') as infile:
-                with mmap.mmap(infile.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
-                    plaintext_data = mmapped_file[:]
-        else:
-            with open(input_path, 'rb') as infile:
-                while True:
-                    chunk = infile.read(config["chunk_size"])
-                    if not chunk:
-                        break
-                    plaintext_data += chunk
-
-        # --- V9: Obfuskasi di Memori ---
-        if config.get("enable_memory_obfuscation", False):
-             plaintext_data = obfuscate_memory(plaintext_data)
+        with open(input_path, 'rb') as f_in:
+            plaintext_data = f_in.read()
 
         # --- Tambahkan Kompresi di sini ---
         original_checksum = calculate_checksum(plaintext_data)
@@ -1838,15 +2105,6 @@ def encrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
             random_padding = secrets.token_bytes(padding_length)
             data = plaintext_data + random_padding
             padding_added = padding_length
-
-        # --- Pilih Algoritma Encrypted ---
-        algo = AlgorithmNegotiator.get_best_algorithm()
-        if algo is None:
-            print(f"{RED}❌ Error: Tidak ada algoritma enkripsi yang didukung tersedia.{RESET}")
-            logger.error("Tidak ada algoritma enkripsi yang didukung tersedia.")
-            return False, None
-
-        logger.info(f"Menggunakan algoritma: {algo}")
 
         if algo == "aes-gcm":
             if CRYPTOGRAPHY_AVAILABLE:
@@ -2099,6 +2357,77 @@ def decrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
         input_size_log = os.path.getsize(input_path)
         logger.info(f"Ukuran file input: {input_size_log} bytes")
 
+        with open(input_path, 'rb') as f:
+            salt = f.read(config["file_key_length"])
+            magic_bytes = f.read(8)
+
+        if magic_bytes == b"STREAMV1":
+            print(f"{CYAN}Streaming file format terdeteksi. Menggunakan mode streaming...{RESET}")
+            logger.info(f"Using streaming mode for decryption of {input_path}")
+
+            with open(input_path, 'rb') as f_in:
+                # Re-read salt and magic bytes as we're now processing
+                salt = f_in.read(config["file_key_length"])
+                f_in.read(8) # Skip magic bytes
+
+                # Read header
+                algo_len = int.from_bytes(f_in.read(1), 'big')
+                algo = f_in.read(algo_len).decode('utf-8')
+                nonce = f_in.read(config["gcm_nonce_len"])
+                stored_checksum = f_in.read(32)
+
+                # Tag is at the end, need to read content first
+                content_end_pos = input_size_log - config["gcm_tag_len"]
+                tag_pos = content_end_pos
+
+                f_in.seek(len(salt) + 8 + 1 + algo_len + len(nonce) + len(stored_checksum)) # Position after header
+
+                # Derive key and setup decryptor
+                key = derive_key_from_password_and_keyfile(password, salt, keyfile_path)
+                if key is None:
+                    return False, None
+
+                # We must read the tag from the END of the file.
+                f_in.seek(-config["gcm_tag_len"], os.SEEK_END)
+                tag = f_in.read(config["gcm_tag_len"])
+                f_in.seek(len(salt) + 8 + 1 + algo_len + len(nonce) + len(stored_checksum)) # Reset position
+
+                stream_decryptor = StreamDecryptor(key, nonce, tag)
+                calculated_checksum_calculator = hashlib.sha256()
+
+                try:
+                    with open(output_path, 'wb') as f_out:
+                        while f_in.tell() < tag_pos:
+                            chunk = f_in.read(config["chunk_size"])
+                            decrypted_chunk = stream_decryptor.update(chunk)
+                            f_out.write(decrypted_chunk)
+                            calculated_checksum_calculator.update(decrypted_chunk)
+
+                    stream_decryptor.finalize() # This will raise InvalidTag on failure
+                    calculated_checksum = calculated_checksum_calculator.digest()
+
+                    if constant_time_compare(calculated_checksum, stored_checksum):
+                        end_time = time.time()
+                        duration = end_time - start_time
+                        logger.info(f"Durasi dekripsi (streaming): {duration:.2f} detik")
+                        print(f"{GREEN}✅ File '{input_path}' berhasil didekripsi ke '{output_path}' (Streaming Mode).{RESET}")
+                        return True, output_path
+                    else:
+                        print_error_box("Decryption failed: Checksum mismatch.")
+                        logger.error(f"Checksum mismatch for decrypted file {output_path}")
+                        return False, None
+
+                except crypto_exceptions.InvalidTag:
+                    print_error_box("Decryption failed: Kunci salah atau file rusak (Invalid Tag).")
+                    logger.error("Decryption failed due to InvalidTag.", exc_info=True)
+                    return False, None
+                except Exception as e:
+                    print_error_box(f"An error occurred during streaming decryption: {e}")
+                    logger.error(f"Streaming decryption error: {e}", exc_info=True)
+                    return False, None
+
+        # --- Fallback to in-memory for old format ---
+        print(f"{YELLOW}Format file lama terdeteksi. Menggunakan mode in-memory...{RESET}")
         file_structure = []
         parts_read = {}
         with open(input_path, 'rb') as infile:
@@ -2537,6 +2866,67 @@ def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: 
         input_size = os.path.getsize(input_path)
         logger.info(f"Ukuran file input: {input_size} bytes")
 
+        algo = AlgorithmNegotiator.get_best_algorithm()
+        large_file_threshold = config.get("large_file_threshold", 10 * 1024 * 1024)
+
+        # Override to aes-gcm if streaming is possible and file is large
+        if input_size > large_file_threshold and _is_streaming_supported("aes-gcm"):
+            algo = "aes-gcm"
+
+        logger.info(f"Menggunakan algoritma: {algo}")
+
+        if _is_streaming_supported(algo) and input_size > large_file_threshold:
+            print(f"{CYAN}File besar terdeteksi. Menggunakan mode streaming (Master Key)...{RESET}")
+            logger.info(f"Using streaming mode (Master Key) for large file {input_path}")
+
+            # 1. Calculate original checksum
+            original_checksum_calculator = hashlib.sha256()
+            with open(input_path, 'rb') as f_in:
+                while chunk := f_in.read(config["chunk_size"]):
+                    original_checksum_calculator.update(chunk)
+            original_checksum = original_checksum_calculator.digest()
+
+            # 2. Generate and encrypt a unique file key, similar to the in-memory method
+            file_key = secrets.token_bytes(config["file_key_length"])
+            master_fernet_key = base64.urlsafe_b64encode(master_key)
+            master_fernet = Fernet(master_fernet_key)
+            encrypted_file_key = master_fernet.encrypt(file_key)
+
+            # 3. Setup encryptor with the plaintext file key
+            stream_encryptor = StreamEncryptor(file_key)
+            nonce = stream_encryptor.nonce
+
+            # 4. Write file header and stream content
+            with open(output_path, 'wb') as f_out:
+                f_out.write(b"STREAMV1")
+                f_out.write(key_version.to_bytes(4, 'big'))
+                # Store the encrypted file key in the header
+                f_out.write(len(encrypted_file_key).to_bytes(4, 'big'))
+                f_out.write(encrypted_file_key)
+
+                algo_bytes = algo.encode('utf-8')
+                f_out.write(len(algo_bytes).to_bytes(1, 'big'))
+                f_out.write(algo_bytes)
+
+                f_out.write(nonce)
+                f_out.write(original_checksum)
+
+                with open(input_path, 'rb') as f_in:
+                    while chunk := f_in.read(config["chunk_size"]):
+                        encrypted_chunk = stream_encryptor.update(chunk)
+                        f_out.write(encrypted_chunk)
+
+                stream_encryptor.finalize()
+                tag = stream_encryptor.tag
+                f_out.write(tag)
+
+            end_time = time.time()
+            duration = end_time - start_time
+            logger.info(f"Durasi enkripsi (streaming, master key): {duration:.2f} detik")
+            print(f"{GREEN}✅ File '{input_path}' berhasil dienkripsi ke '{output_path}' (Streaming Mode).{RESET}")
+            return True, output_path
+
+        # --- Fallback to in-memory for smaller files ---
         plaintext_data = b""
         # --- V12/V13/V14: Gunakan mmap jika file besar dan diaktifkan ---
         large_file_threshold = config.get("large_file_threshold", 10 * 1024 * 1024) # 10MB default
@@ -2593,24 +2983,34 @@ def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: 
                 register_sensitive_data(f"file_key_{input_path}", file_key)
 
         # --- Pilih Algoritma encrypted ---
-        algo = config.get("encryption_algorithm", "aes-gcm").lower()
         if algo == "aes-gcm":
             if CRYPTOGRAPHY_AVAILABLE:
                 nonce = secrets.token_bytes(config["gcm_nonce_len"])
                 cipher = AESGCM(file_key)
                 ciphertext = cipher.encrypt(nonce, data, associated_data=None)
-                tag = b"" # AESGCM (cryptography) menggabungkan tag
-            elif PYCRYPTODOME_AVAILABLE: # <-- Sekarang variabel ini selalu didefinisikan
-                nonce = get_random_bytes(config["gcm_nonce_len"]) # Gunakan get_random_bytes dari pycryptodome
+                tag = b""
+            elif PYCRYPTODOME_AVAILABLE:
+                nonce = get_random_bytes(config["gcm_nonce_len"])
                 cipher = AES.new(file_key, AES.MODE_GCM, nonce=nonce)
                 ciphertext, tag = cipher.encrypt_and_digest(data)
-            else:
-                print(f"{RED}❌ Error: Tidak ada pustaka tersedia untuk algoritma '{algo}'.{RESET}")
-                logger.error(f"Tidak ada pustaka tersedia untuk algoritma '{algo}'.")
-                return False, None
+        elif algo == "chacha20-poly1305":
+            nonce = secrets.token_bytes(12)
+            cipher = ChaCha20Poly1305(file_key)
+            ciphertext = cipher.encrypt(nonce, data, associated_data=None)
+            tag = b""
+        elif algo == "xchacha20-poly1305":
+            box = nacl.secret.SecretBox(file_key)
+            nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
+            ciphertext = box.encrypt(data, nonce)
+            tag = b""
+        elif algo == "aes-siv":
+            siv = SIV(file_key)
+            ciphertext = siv.seal(data, associated_data=[])
+            nonce = b""
+            tag = b""
         else:
-            print(f"{RED}❌ Error: Algoritma encrypted '{algo}' tidak dikenal atau tidak didukung di versi ini.{RESET}")
-            logger.error(f"Algoritma encrypted '{algo}' tidak dikenal atau tidak didukung di versi ini.")
+            print(f"{RED}❌ Error: Algoritma '{algo}' tidak didukung atau pustaka yang diperlukan tidak ada.{RESET}")
+            logger.error(f"Unsupported algorithm or missing library for '{algo}'.")
             return False, None
 
         # Kunci file terencrypted tetap seperti sebelumnya
@@ -2623,6 +3023,7 @@ def encrypt_file_with_master_key(input_path: str, output_path: str, master_key: 
         # --- V10/V11/V12/V13/V14: Custom File Format Shuffle & Dynamic Header (Variable Parts) ---
         parts_to_write = [
             ("key_version", str(key_version).encode('utf-8')),
+            ("algo_name", algo.encode('utf-8')),
             ("nonce", nonce),
             ("checksum", original_checksum),
             ("padding_added", padding_added.to_bytes(config["padding_size_length"], byteorder='big')),
@@ -2843,6 +3244,80 @@ def decrypt_file_with_master_key(input_path: str, output_path: str, key_manager:
         input_size_log = os.path.getsize(input_path)
         logger.info(f"Ukuran file input: {input_size_log} bytes")
 
+        with open(input_path, 'rb') as f:
+            magic_bytes = f.read(8)
+
+        if magic_bytes == b"STREAMV1":
+            print(f"{CYAN}Streaming file format terdeteksi. Menggunakan mode streaming (Master Key)...{RESET}")
+            logger.info(f"Using streaming mode (Master Key) for decryption of {input_path}")
+
+            with open(input_path, 'rb') as f_in:
+                f_in.read(8) # Skip magic bytes
+
+                # Read header
+                key_version = int.from_bytes(f_in.read(4), 'big')
+
+                # Retrieve the master key for this version
+                try:
+                    master_key = key_manager.get_key_by_version(key_version)
+                except ValueError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    logger.error(f"Failed to get key version {key_version}: {e}")
+                    return False, None
+
+                # Read the encrypted file key and decrypt it
+                encrypted_key_len = int.from_bytes(f_in.read(4), 'big')
+                encrypted_file_key = f_in.read(encrypted_key_len)
+                master_fernet_key = base64.urlsafe_b64encode(master_key)
+                master_fernet = Fernet(master_fernet_key)
+                file_key = master_fernet.decrypt(encrypted_file_key)
+
+                algo_len = int.from_bytes(f_in.read(1), 'big')
+                algo = f_in.read(algo_len).decode('utf-8')
+                nonce = f_in.read(config["gcm_nonce_len"])
+                stored_checksum = f_in.read(32)
+
+                header_end_pos = 8 + 4 + 4 + encrypted_key_len + 1 + algo_len + len(nonce) + len(stored_checksum)
+                tag_pos = input_size_log - config["gcm_tag_len"]
+
+                # Read tag from the end of the file
+                f_in.seek(-config["gcm_tag_len"], os.SEEK_END)
+                tag = f_in.read(config["gcm_tag_len"])
+                f_in.seek(header_end_pos) # Reset position
+
+                stream_decryptor = StreamDecryptor(file_key, nonce, tag)
+                calculated_checksum_calculator = hashlib.sha256()
+
+                try:
+                    with open(output_path, 'wb') as f_out:
+                        while f_in.tell() < tag_pos:
+                            chunk = f_in.read(config["chunk_size"])
+                            decrypted_chunk = stream_decryptor.update(chunk)
+                            f_out.write(decrypted_chunk)
+                            calculated_checksum_calculator.update(decrypted_chunk)
+
+                    stream_decryptor.finalize()
+                    calculated_checksum = calculated_checksum_calculator.digest()
+
+                    if constant_time_compare(calculated_checksum, stored_checksum):
+                        end_time = time.time()
+                        duration = end_time - start_time
+                        logger.info(f"Durasi dekripsi (streaming, master key): {duration:.2f} detik")
+                        print(f"{GREEN}✅ File '{input_path}' berhasil didekripsi ke '{output_path}' (Streaming Mode).{RESET}")
+                        return True, output_path
+                    else:
+                        print_error_box("Decryption failed: Checksum mismatch.")
+                        return False, None
+
+                except crypto_exceptions.InvalidTag:
+                    print_error_box("Decryption failed: Kunci salah atau file rusak (Invalid Tag).")
+                    return False, None
+                except Exception as e:
+                    print_error_box(f"An error occurred during streaming decryption: {e}")
+                    return False, None
+
+        # --- Fallback to in-memory for old format ---
+        print(f"{YELLOW}Format file lama terdeteksi. Menggunakan mode in-memory...{RESET}")
         file_structure = []
         parts_read = {}
         with open(input_path, 'rb') as infile:
@@ -2975,28 +3450,40 @@ def decrypt_file_with_master_key(input_path: str, output_path: str, key_manager:
                 register_sensitive_data(f"hmac_key_{input_path}", hmac_key)
 
         # --- Decryption berdasarkan algoritma ---
-        algo = config.get("encryption_algorithm", "aes-gcm").lower()
-        if algo == "aes-gcm":
-            if PYCRYPTODOME_AVAILABLE: # <-- Sekarang variabel ini selalu didefinisikan
-                cipher = AES.new(file_key, AES.MODE_GCM, nonce=nonce)
-                try:
+        algo_name_bytes = parts_read.get("algo_name")
+        if algo_name_bytes:
+            algo = algo_name_bytes.decode('utf-8')
+        else:
+            # Fallback for old file format without algo identifier
+            algo = config.get("encryption_algorithm", "aes-gcm").lower()
+            logger.warning(f"File format lama terdeteksi. Menggunakan algoritma dari konfigurasi: {algo}")
+
+        try:
+            if algo == "aes-gcm":
+                if PYCRYPTODOME_AVAILABLE and tag:
+                    cipher = AES.new(file_key, AES.MODE_GCM, nonce=nonce)
                     plaintext_data = cipher.decrypt_and_verify(ciphertext, tag)
-                except ValueError:
-                    print(f"{RED}❌ Error: Decryption gagal. File rusak (otentikasi AES-GCM gagal).{RESET}")
-                    logger.error(f"Decryption gagal (otentikasi AES-GCM pycryptodome) untuk {input_path}") # Perbaikan: gunakan input_path
-                    return False, None
-            elif CRYPTOGRAPHY_AVAILABLE:
-                cipher = AESGCM(file_key)
-                try:
+                elif CRYPTOGRAPHY_AVAILABLE:
+                    cipher = AESGCM(file_key)
                     plaintext_data = cipher.decrypt(nonce, ciphertext, associated_data=None)
-                except Exception as e:
-                    print(f"{RED}❌ Error: Decryption gagal. File rusak (otentikasi AES-GCM cryptography gagal).{RESET}")
-                    logger.error(f"Decryption gagal (otentikasi AES-GCM cryptography) untuk {input_path}: {e}") # Perbaikan: gunakan input_path
-                    return False, None
+                else:
+                    raise RuntimeError("Tidak ada pustaka tersedia untuk dekripsi AES-GCM.")
+            elif algo == "chacha20-poly1305":
+                cipher = ChaCha20Poly1305(file_key)
+                plaintext_data = cipher.decrypt(nonce, ciphertext, associated_data=None)
+            elif algo == "xchacha20-poly1305":
+                box = nacl.secret.SecretBox(file_key)
+                plaintext_data = box.decrypt(ciphertext)
+            elif algo == "aes-siv":
+                siv = SIV(file_key)
+                plaintext_data = siv.open(ciphertext, associated_data=[])
             else:
-                print(f"{RED}❌ Error: Tidak ada pustaka tersedia untuk decryption AES-GCM.{RESET}")
-                logger.error(f"Tidak ada pustaka tersedia untuk decryption AES-GCM.")
-                return False, None
+                raise ValueError(f"Algoritma tidak dikenal: {algo}")
+        except Exception as e:
+            print(f"{RED}❌ Error: Dekripsi gagal. Kunci mungkin salah atau file rusak.{RESET}")
+            logger.error(f"Dekripsi gagal untuk algoritma {algo}: {e}")
+            return False, None
+
         if padding_added > 0:
             if len(plaintext_data) < padding_added:
                 print(f"{RED}❌ Error: File input rusak (padding yang disimpan lebih besar dari data hasil decryption).{RESET}")
@@ -3436,10 +3923,11 @@ def interactive_mode():
     if not CRYPTOGRAPHY_AVAILABLE:
         print_error_box("Mode interaktif memerlukan modul 'cryptography'. Silakan instal.")
         sys.exit(1)
+
     setup_logging(interactive_mode=True)
-    clear_screen()
 
     while True:
+        clear_screen()
         print_box(
             f"Thena_Dev Script V19",
             [
@@ -3465,7 +3953,6 @@ def interactive_mode():
             print_error_box("Pilihan tidak valid.")
 
         input(f"\n{CYAN}Tekan Enter untuk kembali ke menu utama...{RESET}")
-        clear_screen()
 
 
 def batch_process(directory: str, mode: str, password: str, keyfile_path: str = None, add_padding: bool = True, hide_paths: bool = False, parallel: bool = False):
@@ -3547,6 +4034,10 @@ def batch_process(directory: str, mode: str, password: str, keyfile_path: str = 
 # --- Fungsi Utama ---
 def main():
     """The main function of the application."""
+    # --- Startup Checks ---
+    detect_hardware_acceleration()
+    PerformanceTuner.tune_argon2_params()
+
     # --- V10: Inisialisasi Hardening ---
     # Deteksi Debugging (V10/V11/V12/V13/V14)
     if config.get("enable_anti_debug", False):
@@ -3629,121 +4120,99 @@ def main():
             print_error_box(f"Error: Algoritma '{args.algo}' tidak valid.")
             sys.exit(1)
 
-    if args.batch:
-        if not args.dir or not args.password:
-            print(f"{RED}❌ Error: Argumen --dir dan --password wajib untuk mode batch.{RESET}")
-            sys.exit(1)
-        if not (args.encrypt or args.decrypt):
-            print(f"{RED}❌ Error: Pilih --encrypt atau --decrypt untuk mode batch.{RESET}")
-            sys.exit(1)
-        batch_process(args.dir, 'encrypt' if args.encrypt else 'decrypt', args.password, args.keyfile, add_padding=not args.no_padding, hide_paths=args.hide_paths, parallel=config.get("batch_parallel", False))
+    # --- Mode Selection and Execution ---
+    # Determine mode based on arguments. This simplifies the logic flow.
+    use_master_key_mode = '--keystore' in sys.argv or args.rotate_key
+
+    # No arguments provided, start interactive mode.
+    if not (args.encrypt or args.decrypt or args.batch or args.rotate_key):
+        interactive_mode()
         return
 
-    if args.encrypt or args.decrypt:
-        if not args.input or not args.output or not args.password:
-            print_error_box("Error: Argumen --input, --output, dan --password wajib untuk mode baris perintah tunggal.")
-            sys.exit(1)
-
-        input_path = args.input
-        output_path = args.output
+    # All command-line operations require a password.
+    if args.password:
         password = args.password
         keyfile_path = args.keyfile
+    else:
+        print_error_box("Error: --password is required for command-line operations.")
+        sys.exit(1)
+
+    # --- Batch Mode ---
+    if args.batch:
+        if not args.dir:
+            print_error_box("Error: --dir is required for batch mode.")
+            sys.exit(1)
+        if not (args.encrypt or args.decrypt):
+            print_error_box("Error: Must specify --encrypt or --decrypt for batch mode.")
+            sys.exit(1)
+
+        mode = 'encrypt' if args.encrypt else 'decrypt'
         add_padding = not args.no_padding
-        if args.no_padding: add_padding = False
-        if args.add_padding: add_padding = True
-        hide_paths = args.hide_paths
+        batch_process(args.dir, mode, password, keyfile_path, add_padding, args.hide_paths, config.get("batch_parallel", False))
+        return
 
-        if not os.path.isfile(input_path):
-            print_error_box(f"Error: File input '{input_path}' tidak ditemukan.")
+    # --- Master Key Mode ---
+    if use_master_key_mode:
+        key_manager = KeyManager(args.keystore, password, keyfile_path)
+        key_manager.check_rotation_policy()
+
+        if args.rotate_key:
+            key_manager.rotate_key()
+            return
+
+        if not args.input or not args.output:
+            print_error_box("Error: --input and --output are required for master key operations.")
             sys.exit(1)
 
-        if keyfile_path and not os.path.isfile(keyfile_path):
-             print_error_box(f"Error: File keyfile '{keyfile_path}' tidak ditemukan.")
-             sys.exit(1)
-
-        if not validate_password_keyfile(password, keyfile_path):
-            print_error_box("Error: Validasi password/keyfile gagal.")
-            sys.exit(1)
-
-        if not check_file_size_limit(input_path):
-            sys.exit(1)
-
-        # Validasi ekstensi untuk mode baris perintah
+        add_padding = not args.no_padding
+        success = False # Initialize success flag
         if args.encrypt:
-            if not output_path.endswith('.encrypted'):
-                print(f"{YELLOW}⚠️  Peringatan: Nama file output '{output_path}' tidak memiliki ekstensi '.encrypted'.{RESET}")
-                confirm = input(f"{YELLOW}Lanjutkan? (y/N): {RESET}").strip().lower()
-                if confirm not in ['y', 'yes']:
-                    print(f"{YELLOW}Operasi dibatalkan.{RESET}")
-                    sys.exit(0)
+            master_key = key_manager.get_active_key()
+            active_version = key_manager.get_active_key_version()
+            success, out = encrypt_file_with_master_key(args.input, args.output, master_key, active_version, add_padding, args.hide_paths)
         elif args.decrypt:
-            if not input_path.endswith('.encrypted'):
-                print(f"{YELLOW}⚠️  Peringatan: File input '{input_path}' tidak memiliki ekstensi '.encrypted'.{RESET}")
-                confirm = input(f"{YELLOW}Apakah ini file terencrypted Thena_dev? (y/N): {RESET}").strip().lower()
-                if confirm not in ['y', 'yes']:
-                    print(f"{YELLOW}Operasi dibatalkan.{RESET}")
-                    sys.exit(0)
+            success, out = decrypt_file_with_master_key(args.input, args.output, key_manager, args.hide_paths)
+        else: # Should not happen if rotate_key is handled
+            print_error_box("Error: --encrypt or --decrypt must be specified with --keystore.")
+            sys.exit(1)
 
-        if config["encryption_algorithm"] == "hybrid-rsa-x25519":
+    # --- Simple/Hybrid Mode ---
+    elif args.encrypt or args.decrypt:
+        if not args.input or not args.output:
+            print_error_box("Error: --input and --output are required.")
+            sys.exit(1)
+
+        # Decide between Hybrid and Simple based on config and --algo override
+        is_hybrid = config["encryption_algorithm"] == "hybrid-rsa-x25519" and not args.algo
+        add_padding = not args.no_padding
+        success = False # Initialize success flag
+
+        if is_hybrid:
             if not CRYPTOGRAPHY_AVAILABLE:
-                print_error_box("Hybrid encryption requires the 'cryptography' module.")
+                print_error_box("Hybrid mode requires 'cryptography' module.")
                 sys.exit(1)
             if args.encrypt:
-                rsa_private_key, x25519_private_key = load_keys(password, keyfile_path)
-                if rsa_private_key is None:
-                    print(f"{YELLOW}Kunci tidak ditemukan. Membuat kunci baru...{RESET}")
-                    rsa_private_key, x25519_private_key = generate_and_save_keys(password, keyfile_path)
-                    if rsa_private_key is None:
-                        print_error_box("Gagal membuat kunci. Operasi dibatalkan.")
-                        sys.exit(1)
-                    print(f"{GREEN}Kunci baru berhasil dibuat dan disimpan.{RESET}")
-                encrypt_file_hybrid(input_path, output_path, password, keyfile_path, hide_paths=hide_paths)
-                print_box(f"Enkripsi selesai: {input_path} -> {output_path}")
-            elif args.decrypt:
-                rsa_private_key, x25519_private_key = load_keys(password, keyfile_path)
-                if rsa_private_key is None:
-                    print_error_box("Gagal memuat kunci. Periksa kata sandi/keyfile Anda.")
-                    sys.exit(1)
-                try:
-                    decrypt_file_hybrid(input_path, output_path, password, keyfile_path, hide_paths=hide_paths)
-                    print_box(f"Dekripsi selesai: {input_path} -> {output_path}")
-                except (exceptions.InvalidSignature, ValueError) as e:
-                    print_error_box(f"Dekripsi gagal: {e}")
-                    sys.exit(1)
-        else: # aes-gcm
-            # --- KeyManager Integration ---
-            key_manager = KeyManager(args.keystore, password, keyfile_path)
-            key_manager.check_rotation_policy() # Automatically rotate if policy dictates
-
-            if args.rotate_key:
-                key_manager.rotate_key()
-                print_box("Rotasi kunci selesai.")
-                sys.exit(0)
-
+                success = encrypt_file_hybrid(args.input, args.output, password, keyfile_path, args.hide_paths)
+            else:
+                success = decrypt_file_hybrid(args.input, args.output, password, keyfile_path, args.hide_paths)
+        else: # Simple mode
             if args.encrypt:
-                master_key = key_manager.get_active_key()
-                active_version = key_manager.get_active_key_version()
-                encryption_success, created_output = encrypt_file_with_master_key(
-                    input_path, output_path, master_key, active_version,
-                    add_random_padding=add_padding, hide_paths=hide_paths
-                )
-                if encryption_success:
-                    print_box(f"Enkripsi selesai: {input_path} -> {created_output}")
-                else:
-                    print_error_box("Enkripsi gagal.")
-                    sys.exit(1)
-            elif args.decrypt:
-                decryption_success, created_output = decrypt_file_with_master_key(
-                    input_path, output_path, key_manager, hide_paths=hide_paths
-                )
-                if decryption_success:
-                    print_box(f"Dekripsi selesai: {input_path} -> {created_output}")
-                else:
-                    print_error_box("Dekripsi gagal.")
-                    sys.exit(1)
+                success, _ = encrypt_file_simple(args.input, args.output, password, keyfile_path, add_padding, args.hide_paths)
+            else:
+                success, _ = decrypt_file_simple(args.input, args.output, password, keyfile_path, args.hide_paths)
 
     else:
-        interactive_mode()
+        # This case handles situations where only non-actionable flags like --password are passed.
+        print_error_box("No action specified. Please use --encrypt, --decrypt, --batch, or run without arguments for interactive mode.")
+        sys.exit(1)
+
+    # Common success/failure message for single-file operations
+    if 'success' in locals() and success:
+        print_box(f"Operasi selesai: {args.input} -> {args.output}")
+    else:
+        # Print to stderr for test runners to capture
+        print("Operasi gagal.", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
