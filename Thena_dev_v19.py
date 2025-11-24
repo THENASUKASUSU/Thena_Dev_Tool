@@ -113,7 +113,22 @@ import struct # Impor struct untuk header dinamis (V12/V13/V14)
 import secrets
 import time
 import psutil
-import cpuinfo
+try:
+    import cpuinfo
+    CPUINFO_AVAILABLE = True
+except ImportError:
+    CPUINFO_AVAILABLE = False
+    print(f"{YELLOW}⚠️  Modul 'cpuinfo' tidak tersedia. Hardware detection dinonaktifkan.{RESET}")
+
+def safe_cpu_info():
+    """Safe CPU info detection with fallback for Termux"""
+    if not CPUINFO_AVAILABLE:
+        return {'flags': []}
+    try:
+        return cpuinfo.get_cpu_info()
+    except Exception as e:
+        logger.warning(f"CPU info detection failed: {e}")
+        return {'flags': []}
 
 # --- Nama File Konfigurasi dan Log ---
 CONFIG_FILE = "thena_config_v18.json"
@@ -350,27 +365,20 @@ def detect_debugging():
     return False
 
 def secure_mlock(addr, length):
-    """Locks a memory area to prevent it from being swapped to disk.
-
-    This function is a wrapper around the `mlock` syscall, which is only
-    available on Unix-like systems.
-
-    Args:
-        addr: The starting address of the memory area to lock.
-        length: The length of the memory area to lock.
-    """
-    if platform.system() != "Windows": # Tidak berlaku untuk Windows
+    """Locks memory with Termux compatibility"""
+    if platform.system() == "Linux" and hasattr(os, 'mlock'):
         try:
-            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            # Try using os.mlock which works better on Android
+            import ctypes
+            libc = ctypes.CDLL(None)
             result = libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(length))
-            if result != 0:
-                logger.warning(f"Gagal mengunci memori di alamat {hex(addr)} (mlock).")
+            if result == 0:
+                logger.debug(f"Memory locked at {hex(addr)} ({length} bytes)")
             else:
-                logger.debug(f"Memori di alamat {hex(addr)} ({length} bytes) dikunci (mlock).")
-        except (OSError, AttributeError):
-            logger.warning("Fungsi mlock tidak tersedia di platform ini.")
-    else:
-        logger.info("mlock tidak didukung di Windows.")
+                logger.warning(f"mlock failed: {ctypes.get_errno()}")
+        except (OSError, AttributeError) as e:
+            logger.warning(f"mlock not available: {e}")
+    # Windows and other platforms remain unchanged
 
 def secure_munlock(addr, length):
     """Unlocks a memory area, allowing it to be swapped to disk.
@@ -1008,7 +1016,7 @@ def deobfuscate_memory(data) -> bytes:
 def detect_hardware_acceleration():
     """Detects CPU features for hardware-accelerated cryptography."""
     try:
-        info = cpuinfo.get_cpu_info()
+        info = safe_cpu_info()
         flags = info.get('flags', [])
 
         supported_features = []
@@ -1031,6 +1039,30 @@ def detect_hardware_acceleration():
 
     except Exception as e:
         logger.warning(f"Tidak dapat mendeteksi fitur hardware: {e}")
+
+def safe_tune_argon2_params():
+    """Safe parameter tuning for resource-constrained environments"""
+    try:
+        if not config.get("auto_tune_performance", False):
+            return
+
+        # Conservative tuning for Termux/Android
+        available_mem_gb = psutil.virtual_memory().available / (1024**3)
+        cpu_cores = psutil.cpu_count(logical=False) or 1
+
+        # Limit memory usage on low-memory devices
+        if available_mem_gb < 2:  # < 2GB RAM
+            config["argon2_memory_cost"] = 2**18  # 256MB
+            config["argon2_parallelism"] = 1
+        elif available_mem_gb < 4:  # < 4GB RAM
+            config["argon2_memory_cost"] = 2**19  # 512MB
+            config["argon2_parallelism"] = min(2, cpu_cores)
+        else:
+            # Use original tuning for better equipped systems
+            PerformanceTuner.tune_argon2_params()
+
+    except Exception as e:
+        logger.warning(f"Safe tuning failed, using defaults: {e}")
 
 class PerformanceTuner:
     """Dynamically tunes performance parameters based on system resources."""
@@ -1104,15 +1136,23 @@ class StreamDecryptor:
     def __init__(self, key, nonce, tag):
         self.key = key
         self.nonce = nonce
-        cipher = Cipher(algorithms.AES(self.key), modes.GCM(self.nonce, tag))
-        self.decryptor = cipher.decryptor()
+        self.tag = tag
+        if CRYPTOGRAPHY_AVAILABLE:
+            cipher = Cipher(algorithms.AES(self.key), modes.GCM(self.nonce, self.tag))
+            self.decryptor = cipher.decryptor()
+        else:
+            raise RuntimeError("Cryptography required for streaming")
 
     def update(self, chunk):
         return self.decryptor.update(chunk)
 
     def finalize(self):
-        self.decryptor.finalize()
-        return b""
+        try:
+            self.decryptor.finalize()
+            return b""
+        except Exception as e:
+            logger.error(f"Stream decryption finalize failed: {e}")
+            raise
 
 def constant_time_compare(val1, val2):
     """Performs a constant-time comparison of two values."""
@@ -1369,6 +1409,7 @@ class KeyManager:
         self.keystore_path = keystore_path
         self.password = password
         self.keyfile_path = keyfile_path
+        self._lock = threading.RLock()
         self.keystore = self._load_or_initialize_keystore()
 
     def _derive_keystore_key(self, salt):
@@ -1409,65 +1450,67 @@ class KeyManager:
 
     def _load_or_initialize_keystore(self):
         """Loads the keystore from file or creates a new one."""
-        if os.path.exists(self.keystore_path):
-            try:
-                with open(self.keystore_path, 'rb') as f:
-                    salt = f.read(16)
-                    nonce = f.read(12)
-                    encrypted_data = f.read()
+        with self._lock:
+            if os.path.exists(self.keystore_path):
+                try:
+                    with open(self.keystore_path, 'rb') as f:
+                        salt = f.read(16)
+                        nonce = f.read(12)
+                        encrypted_data = f.read()
 
-                keystore_key = self._derive_keystore_key(salt)
-                if keystore_key is None:
-                    raise ValueError("Gagal menurunkan kunci keystore.")
+                    keystore_key = self._derive_keystore_key(salt)
+                    if keystore_key is None:
+                        raise ValueError("Gagal menurunkan kunci keystore.")
 
-                cipher = AESGCM(keystore_key)
-                decrypted_data = cipher.decrypt(nonce, encrypted_data, None)
-                return json.loads(decrypted_data.decode('utf-8'))
-            except (FileNotFoundError, ValueError, json.JSONDecodeError, crypto_exceptions.InvalidTag, TypeError) as e:
-                message = f"Gagal memuat keystore, mungkin rusak atau password salah: {e}"
-                print(message, file=sys.stderr)
-                logger.error(f"Gagal memuat keystore: {e}", exc_info=True)
-                # In a real scenario, you might want to handle this more gracefully
-                # For now, we'll exit to prevent creating a new keystore over a potentially recoverable one.
-                sys.exit(1)
-        else:
-            # Keystore does not exist, create a new one with the first master key
-            print(f"{YELLOW}Keystore tidak ditemukan di '{self.keystore_path}'. Membuat yang baru...{RESET}")
-            initial_keystore = {
-                "keys": {},
-                "active_key_version": 1,
-                "key_rotation_policy": config.get("key_rotation_policy", {
-                    "enabled": False,
-                    "interval_days": 90
-                })
-            }
-            self.keystore = initial_keystore
-            self._generate_new_key(is_initial_key=True)
-            self._save_keystore()
-            print(f"{GREEN}Keystore baru berhasil dibuat.{RESET}")
-            return self.keystore
+                    cipher = AESGCM(keystore_key)
+                    decrypted_data = cipher.decrypt(nonce, encrypted_data, None)
+                    return json.loads(decrypted_data.decode('utf-8'))
+                except (FileNotFoundError, ValueError, json.JSONDecodeError, crypto_exceptions.InvalidTag, TypeError) as e:
+                    message = f"Gagal memuat keystore, mungkin rusak atau password salah: {e}"
+                    print(message, file=sys.stderr)
+                    logger.error(f"Gagal memuat keystore: {e}", exc_info=True)
+                    # In a real scenario, you might want to handle this more gracefully
+                    # For now, we'll exit to prevent creating a new keystore over a potentially recoverable one.
+                    sys.exit(1)
+            else:
+                # Keystore does not exist, create a new one with the first master key
+                print(f"{YELLOW}Keystore tidak ditemukan di '{self.keystore_path}'. Membuat yang baru...{RESET}")
+                initial_keystore = {
+                    "keys": {},
+                    "active_key_version": 1,
+                    "key_rotation_policy": config.get("key_rotation_policy", {
+                        "enabled": False,
+                        "interval_days": 90
+                    })
+                }
+                self.keystore = initial_keystore
+                self._generate_new_key(is_initial_key=True)
+                self._save_keystore()
+                print(f"{GREEN}Keystore baru berhasil dibuat.{RESET}")
+                return self.keystore
 
     def _save_keystore(self):
         """Encrypts and saves the keystore to file."""
-        try:
-            salt = secrets.token_bytes(16)
-            keystore_key = self._derive_keystore_key(salt)
-            if keystore_key is None:
-                raise ValueError("Gagal menurunkan kunci keystore untuk menyimpan.")
+        with self._lock:
+            try:
+                salt = secrets.token_bytes(16)
+                keystore_key = self._derive_keystore_key(salt)
+                if keystore_key is None:
+                    raise ValueError("Gagal menurunkan kunci keystore untuk menyimpan.")
 
-            keystore_bytes = json.dumps(self.keystore, indent=4).encode('utf-8')
+                keystore_bytes = json.dumps(self.keystore, indent=4).encode('utf-8')
 
-            cipher = AESGCM(keystore_key)
-            nonce = secrets.token_bytes(12)
-            encrypted_data = cipher.encrypt(nonce, keystore_bytes, None)
+                cipher = AESGCM(keystore_key)
+                nonce = secrets.token_bytes(12)
+                encrypted_data = cipher.encrypt(nonce, keystore_bytes, None)
 
-            with open(self.keystore_path, 'wb') as f:
-                f.write(salt)
-                f.write(nonce)
-                f.write(encrypted_data)
-        except (IOError, OSError, ValueError) as e:
-            print_error_box(f"Gagal menyimpan keystore: {e}")
-            logger.error(f"Gagal menyimpan keystore: {e}", exc_info=True)
+                with open(self.keystore_path, 'wb') as f:
+                    f.write(salt)
+                    f.write(nonce)
+                    f.write(encrypted_data)
+            except (IOError, OSError, ValueError) as e:
+                print_error_box(f"Gagal menyimpan keystore: {e}")
+                logger.error(f"Gagal menyimpan keystore: {e}", exc_info=True)
 
 
     def _generate_new_key(self, is_initial_key=False):
@@ -2397,11 +2440,16 @@ def decrypt_file_simple(input_path: str, output_path: str, password: str, keyfil
 
                 try:
                     with open(output_path, 'wb') as f_out:
-                        while f_in.tell() < tag_pos:
-                            chunk = f_in.read(config["chunk_size"])
+                        bytes_to_read = tag_pos - f_in.tell()
+                        while bytes_to_read > 0:
+                            chunk_size = min(config["chunk_size"], bytes_to_read)
+                            chunk = f_in.read(chunk_size)
+                            if not chunk:
+                                break
                             decrypted_chunk = stream_decryptor.update(chunk)
                             f_out.write(decrypted_chunk)
                             calculated_checksum_calculator.update(decrypted_chunk)
+                            bytes_to_read -= len(chunk)
 
                     stream_decryptor.finalize() # This will raise InvalidTag on failure
                     calculated_checksum = calculated_checksum_calculator.digest()
@@ -3290,12 +3338,16 @@ def decrypt_file_with_master_key(input_path: str, output_path: str, key_manager:
 
                 try:
                     with open(output_path, 'wb') as f_out:
-                        while f_in.tell() < tag_pos:
-                            chunk = f_in.read(config["chunk_size"])
+                        bytes_to_read = tag_pos - f_in.tell()
+                        while bytes_to_read > 0:
+                            chunk_size = min(config["chunk_size"], bytes_to_read)
+                            chunk = f_in.read(chunk_size)
+                            if not chunk:
+                                break
                             decrypted_chunk = stream_decryptor.update(chunk)
                             f_out.write(decrypted_chunk)
                             calculated_checksum_calculator.update(decrypted_chunk)
-
+                            bytes_to_read -= len(chunk)
                     stream_decryptor.finalize()
                     calculated_checksum = calculated_checksum_calculator.digest()
 
@@ -4036,7 +4088,7 @@ def main():
     """The main function of the application."""
     # --- Startup Checks ---
     detect_hardware_acceleration()
-    PerformanceTuner.tune_argon2_params()
+    safe_tune_argon2_params()
 
     # --- V10: Inisialisasi Hardening ---
     # Deteksi Debugging (V10/V11/V12/V13/V14)
